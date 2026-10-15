@@ -40,16 +40,13 @@ Open-source CUPS driver for Deli P3100DN / P3100DW / M3100 series monochrome las
 
 ---
 
-### Method 2. Build and Install Debian Package (`.deb`)
+### Method 2. Install via Debian Package (`.deb`)
 
-1. Build the package:
-   ```bash
-   python3 build_deb.py
-   ```
-2. Install the generated `.deb` package:
-   ```bash
-   sudo apt install ./deli-p3100dn_1.0-1_all.deb
-   ```
+Download the pre-built `deli-p3100dn_1.0-1_all.deb` from [Releases](https://github.com/Hamich116/deli-p3100dn-linux-driver/releases) (or build it locally with `python3 build_deb.py`), then install:
+
+```bash
+sudo apt install ./deli-p3100dn_1.0-1_all.deb
+```
 
 ---
 

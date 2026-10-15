@@ -40,16 +40,13 @@
 
 ---
 
-### Способ 2. Сборка и установка через .deb пакет (Debian / Ubuntu / Astra Linux)
+### Способ 2. Установка через .deb пакет (Debian / Ubuntu / Astra Linux)
 
-1. Соберите `.deb` пакет:
-   ```bash
-   python3 build_deb.py
-   ```
-2. Установите созданный пакет:
-   ```bash
-   sudo apt install ./deli-p3100dn_1.0-1_all.deb
-   ```
+Скачайте готовый пакет `deli-p3100dn_1.0-1_all.deb` со страницы [Releases](https://github.com/Hamich116/deli-p3100dn-linux-driver/releases) (либо соберите локально через `python3 build_deb.py`), затем установите:
+
+```bash
+sudo apt install ./deli-p3100dn_1.0-1_all.deb
+```
 
 ---
 
