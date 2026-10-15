@@ -18,7 +18,17 @@
 
 ## Установка
 
-### Способ 1. Быстрая установка через `install.sh` (любой дистрибутив Linux)
+### Способ 1. Установка через .deb пакет (Рекомендуется для Debian / Ubuntu / Astra Linux)
+
+Скачайте готовый пакет `deli-p3100dn_1.0-1_all.deb` со страницы [Releases](https://github.com/Hamich116/deli-p3100dn-linux-driver/releases) (либо соберите локально через `python3 build_deb.py`), затем установите:
+
+```bash
+sudo apt install ./deli-p3100dn_1.0-1_all.deb
+```
+
+---
+
+### Способ 2. Установка через скрипт `install.sh` (Другие дистрибутивы Linux / вручную)
 
 1. Клонируйте репозиторий или скачайте архив:
    ```bash
@@ -37,16 +47,6 @@
    ```
 
 *(Для удаления драйвера выполните: `sudo ./install.sh --uninstall`)*
-
----
-
-### Способ 2. Установка через .deb пакет (Debian / Ubuntu / Astra Linux)
-
-Скачайте готовый пакет `deli-p3100dn_1.0-1_all.deb` со страницы [Releases](https://github.com/Hamich116/deli-p3100dn-linux-driver/releases) (либо соберите локально через `python3 build_deb.py`), затем установите:
-
-```bash
-sudo apt install ./deli-p3100dn_1.0-1_all.deb
-```
 
 ---
 
