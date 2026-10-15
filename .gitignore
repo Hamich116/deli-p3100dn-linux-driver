@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / binaries
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dll
+*.exe
+
+# Distribution / packaging
+*.deb
+dist/
+build/
+*.egg-info/
+
+# Environments and IDEs
+.env
+.venv
+env/
+venv/
+.idea/
+.vscode/
+*.swp
+*~
+
+# Operating System files
+.DS_Store
+Thumbs.db

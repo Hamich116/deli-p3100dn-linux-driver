@@ -1,0 +1,9 @@
+# Auto detect text files and perform LF normalization on checkout
+* text=auto eol=lf
+
+# Explicitly ensure shell scripts and python filters have LF
+*.sh text eol=lf
+rastertodeli text eol=lf
+*.ppd text eol=lf
+*.py text eol=lf
+*.md text eol=lf

@@ -1,0 +1,1070 @@
+#!/usr/bin/env python3
+"""
+CUPS raster filter for Deli P3100DN / P3100DW / M3100 series laser printers.
+PCL-XL / Deli Enhanced XL=1.2 protocol filter for CUPS (v1.0 Dual-Engine):
+  - Simplex (1-sided) jobs use Engine A:
+    1-bit full-page single-layer JBIG1 compression (ColorDepth=0 / e1Bit, \xC0\x00\xF8\x34).
+  - Duplex (2-sided) jobs use Engine B:
+    8-bit 256-line Deli-JPEG band compression (ColorDepth=2 / e8Bit, \xC0\x01\xF8\x35 or \xC0\x00\xF8\x35).
+    Note: Deli P3100DN hardware controller requires 8-bit 256-line Deli-JPEG
+    band compression whenever DuplexPageMode (\xF8\x35) is active.
+"""
+
+import sys
+import os
+import io
+import ctypes
+import ctypes.util
+import struct
+import subprocess
+
+def log(msg):
+    sys.stderr.write(f"DEBUG: [rastertodeli] {msg}\n")
+    sys.stderr.flush()
+
+def error(msg):
+    sys.stderr.write(f"ERROR: [rastertodeli] {msg}\n")
+    sys.stderr.flush()
+
+MEDIA_NAME_MAP = {
+    'a4': 'A4',
+    'letter': 'LETTER',
+    'legal': 'LEGAL',
+    'executive': 'EXECUTIVE',
+    'a5': 'A5',
+    'b5': 'B5',
+    'jisb5': 'B5',
+    'isob5': 'B5',
+    'a6': 'A6',
+}
+
+# Invert table for 1-bit/8-bit pixels (0xFF -> 0x00, 0x00 -> 0xFF)
+INV_TABLE = bytes.maketrans(bytes(range(256)), bytes(255 - i for i in range(256)))
+
+# Lookup table to expand 1 byte (8 bits, where 0=white, 1=black) into 8 grayscale bytes
+# (where 0xFF=white paper, 0x00=black toner)
+BIT_TO_GRAY8_LUT = [
+    bytes(0x00 if (b & (0x80 >> bit)) else 0xFF for bit in range(8))
+    for b in range(256)
+]
+
+# Exact binary layout of struct cups_page_header2_s from <cups/raster.h> (CUPS 1.2+ / CUPS 2.x)
+# Total size: 1796 bytes
+class CUPSPageHeader2(ctypes.Structure):
+    _fields_ = [
+        ("MediaClass", ctypes.c_char * 64),
+        ("MediaColor", ctypes.c_char * 64),
+        ("MediaType", ctypes.c_char * 64),
+        ("OutputType", ctypes.c_char * 64),
+        ("AdvanceDistance", ctypes.c_uint),
+        ("AdvanceMedia", ctypes.c_uint),
+        ("Collate", ctypes.c_uint),
+        ("CutMedia", ctypes.c_uint),
+        ("Duplex", ctypes.c_uint),
+        ("HWResolution", ctypes.c_uint * 2),
+        ("ImagingBoundingBox", ctypes.c_uint * 4),
+        ("InsertSheet", ctypes.c_uint),
+        ("Jog", ctypes.c_uint),
+        ("LeadingEdge", ctypes.c_uint),
+        ("Margins", ctypes.c_uint * 2),
+        ("ManualFeed", ctypes.c_uint),
+        ("MediaPosition", ctypes.c_uint),
+        ("MediaWeight", ctypes.c_uint),
+        ("MirrorPrint", ctypes.c_uint),
+        ("NegativePrint", ctypes.c_uint),
+        ("NumCopies", ctypes.c_uint),
+        ("Orientation", ctypes.c_uint),
+        ("OutputFaceUp", ctypes.c_uint),
+        ("PageSize", ctypes.c_uint * 2),
+        ("Separations", ctypes.c_uint),
+        ("TraySwitch", ctypes.c_uint),
+        ("Tumble", ctypes.c_uint),
+        ("cupsWidth", ctypes.c_uint),
+        ("cupsHeight", ctypes.c_uint),
+        ("cupsMediaType", ctypes.c_uint),
+        ("cupsBitsPerColor", ctypes.c_uint),
+        ("cupsBitsPerPixel", ctypes.c_uint),
+        ("cupsBytesPerLine", ctypes.c_uint),
+        ("cupsColorOrder", ctypes.c_uint),
+        ("cupsColorSpace", ctypes.c_uint),
+        ("cupsCompression", ctypes.c_uint),
+        ("cupsRowCount", ctypes.c_uint),
+        ("cupsRowFeed", ctypes.c_uint),
+        ("cupsRowStep", ctypes.c_uint),
+        ("cupsNumColors", ctypes.c_uint),
+        ("cupsBorderlessScalingFactor", ctypes.c_float),
+        ("cupsPageSize", ctypes.c_float * 2),
+        ("cupsImagingBBox", ctypes.c_float * 4),
+        ("cupsInteger", ctypes.c_uint * 16),
+        ("cupsReal", ctypes.c_float * 16),
+        ("cupsString", (ctypes.c_char * 64) * 16),
+        ("cupsMarkerType", ctypes.c_char * 64),
+        ("cupsRenderingIntent", ctypes.c_char * 64),
+        ("cupsPageSizeName", ctypes.c_char * 64),
+    ]
+
+def load_libcups():
+    candidate_names = [
+        'libcupsimage.so.2',
+        'libcups.so.2',
+        'libcupsimage.so',
+        'libcups.so',
+        '/usr/lib/x86_64-linux-gnu/libcupsimage.so.2',
+        '/usr/lib/x86_64-linux-gnu/libcups.so.2',
+        '/usr/lib/aarch64-linux-gnu/libcups.so.2',
+        '/usr/lib/i386-linux-gnu/libcups.so.2',
+        '/usr/lib/libcupsimage.so.2',
+        '/usr/lib/libcups.so.2',
+        '/usr/lib64/libcupsimage.so.2',
+        '/usr/lib64/libcups.so.2',
+    ]
+    for name in candidate_names:
+        try:
+            lib = ctypes.CDLL(name)
+            if hasattr(lib, 'cupsRasterOpen'):
+                return lib
+        except OSError:
+            pass
+    for name in ('cupsimage', 'cups'):
+        p = ctypes.util.find_library(name)
+        if p:
+            try:
+                lib = ctypes.CDLL(p)
+                if hasattr(lib, 'cupsRasterOpen'):
+                    return lib
+            except OSError:
+                pass
+    return None
+
+def compute_deli_checksum(payload_bytes):
+    """
+    Computes the 32-bit unsigned byte-sum checksum required by the printer controller
+    (for JPEG bands and JBIG1 pages):
+      checksum = 0xFA + sum(4 little-endian length bytes) + sum(payload_bytes)
+    """
+    length = len(payload_bytes)
+    len_sum = (
+        (length & 0xFF)
+        + ((length >> 8) & 0xFF)
+        + ((length >> 16) & 0xFF)
+        + ((length >> 24) & 0xFF)
+    )
+    return (0xFA + len_sum + sum(payload_bytes)) & 0xFFFFFFFF
+
+def verify_jbig_bih(jbig_data, expected_w, expected_h):
+    """
+    Verifies that the 20-byte JBIG1 BIH header is single-layer sequential (DL=0, D=0)
+    with P=1, L0=128, MX=8, MY=0, order=3, options=0x1c (28).
+    """
+    if not jbig_data or len(jbig_data) < 20:
+        return False
+    dl, d, planes, res_byte, xd, yd, l0, mx, my, order, options = struct.unpack(">BBBBIIIbbBB", jbig_data[:20])
+    log(
+        f"JBIG BIH: DL={dl} D={d} P={planes} XD={xd} YD={yd} "
+        f"L0={l0} MX={mx} MY={my} order={order} options=0x{options:02x} (len={len(jbig_data)})"
+    )
+    if dl != 0 or d != 0 or planes != 1 or xd != expected_w or yd != expected_h or l0 != 128 or options != 0x1c:
+        error(
+            f"Invalid JBIG BIH parameters! Expected DL=0, D=0, P=1, XD={expected_w}, YD={expected_h}, "
+            f"L0=128, options=0x1c; got DL={dl}, D={d}, P={planes}, XD={xd}, YD={yd}, L0={l0}, options=0x{options:02x}"
+        )
+        return False
+    return True
+
+def encode_jbig_ctypes(bitmap_bytes, width, height):
+    """Primary JBIG1 encoder via libjbig.so.0 ctypes interface (single-layer D=0)."""
+    candidate_names = [
+        'libjbig.so.0',
+        'libjbig.so',
+        '/usr/lib/x86_64-linux-gnu/libjbig.so.0',
+        '/usr/lib/x86_64-linux-gnu/libjbig.so',
+        '/usr/lib/aarch64-linux-gnu/libjbig.so.0',
+        '/usr/lib/i386-linux-gnu/libjbig.so.0',
+        '/usr/lib/libjbig.so.0',
+        '/usr/lib/libjbig.so',
+        '/usr/lib64/libjbig.so.0',
+        '/usr/lib64/libjbig.so',
+    ]
+    libjbig = None
+    for name in candidate_names:
+        try:
+            libjbig = ctypes.CDLL(name)
+            if hasattr(libjbig, 'jbg_enc_init'):
+                break
+        except OSError:
+            libjbig = None
+    if libjbig is None:
+        p = ctypes.util.find_library('jbig')
+        if p:
+            try:
+                libjbig = ctypes.CDLL(p)
+            except OSError:
+                libjbig = None
+    if libjbig is None:
+        return None
+
+    try:
+        CALLBACK = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t, ctypes.c_void_p)
+        chunks = []
+
+        def data_out(start, length, _file_ptr):
+            chunks.append(ctypes.string_at(start, length))
+
+        cb = CALLBACK(data_out)
+        state = ctypes.create_string_buffer(16384)
+        buf = ctypes.create_string_buffer(bitmap_bytes, len(bitmap_bytes))
+        plane_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte))
+        planes = (ctypes.POINTER(ctypes.c_ubyte) * 1)(plane_ptr)
+
+        libjbig.jbg_enc_init.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)), CALLBACK, ctypes.c_void_p
+        ]
+        libjbig.jbg_enc_options.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_ulong, ctypes.c_int, ctypes.c_int
+        ]
+        libjbig.jbg_enc_out.argtypes = [ctypes.c_void_p]
+        libjbig.jbg_enc_free.argtypes = [ctypes.c_void_p]
+
+        # Single resolution layer (D=0, DL=0), order=3 (ILEAVE|SMID), options=0x1c (28 = TPDON|TPBON|DPON), l0=128, mx=8, my=0
+        libjbig.jbg_enc_init(state, width, height, 1, planes, cb, None)
+        libjbig.jbg_enc_options(state, 3, 0x1c, 128, 8, 0)
+        libjbig.jbg_enc_out(state)
+        libjbig.jbg_enc_free(state)
+        result = b"".join(chunks)
+        if verify_jbig_bih(result, width, height):
+            return result
+        return None
+    except Exception as e:
+        log(f"libjbig ctypes error: {e}")
+        return None
+
+def encode_jbig(raw_bytes, width, height):
+    """
+    Compresses a 1-bit bitmap (where 0 = white background, 1 = black toner dot)
+    into a Deli-compatible single-layer JBIG1 BIE stream.
+    """
+    res = encode_jbig_ctypes(raw_bytes, width, height)
+    if res:
+        return res
+
+    log("libjbig.so.0 not available, falling back to pbmtojbg -q -o 3 -p 28 -s 128")
+    pbm_header = f"P4\n{width} {height}\n".encode('ascii')
+    pbm_payload = pbm_header + raw_bytes
+    try:
+        proc = subprocess.Popen(
+            ['pbmtojbg', '-q', '-o', '3', '-p', '28', '-s', '128', '-'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, stderr = proc.communicate(pbm_payload)
+        if proc.returncode == 0 and verify_jbig_bih(stdout, width, height):
+            return stdout
+        error(f"pbmtojbg failed (code {proc.returncode}): {stderr.decode('utf-8', 'ignore').strip()}")
+    except Exception as e:
+        error(f"pbmtojbg invocation failed: {e}")
+
+    error("All JBIG compression methods failed.")
+    return None
+
+
+# ============================================================================
+# Deli-JPEG Band Encoder for Duplex Printing
+# ============================================================================
+
+_LIBJPEG_CACHE = None
+
+def _init_libjpeg():
+    """Loads libjpeg.so.62 / libjpeg.so.8 and deterministically discovers version, structsize, and restart_in_rows offset."""
+    global _LIBJPEG_CACHE
+    if _LIBJPEG_CACHE is not None:
+        return _LIBJPEG_CACHE
+
+    candidate_names = [
+        'libjpeg.so.62',
+        'libjpeg.so.8',
+        'libjpeg.so',
+        '/usr/lib/x86_64-linux-gnu/libjpeg.so.62',
+        '/usr/lib/x86_64-linux-gnu/libjpeg.so.8',
+        '/usr/lib/aarch64-linux-gnu/libjpeg.so.62',
+        '/usr/lib/i386-linux-gnu/libjpeg.so.62',
+        '/usr/lib/libjpeg.so.62',
+        '/usr/lib64/libjpeg.so.62',
+    ]
+    libjpeg = None
+    for name in candidate_names:
+        try:
+            lib = ctypes.CDLL(name)
+            if hasattr(lib, 'jpeg_CreateCompress'):
+                libjpeg = lib
+                break
+        except OSError:
+            pass
+    if libjpeg is None:
+        p = ctypes.util.find_library('jpeg')
+        if p:
+            try:
+                lib = ctypes.CDLL(p)
+                if hasattr(lib, 'jpeg_CreateCompress'):
+                    libjpeg = lib
+            except OSError:
+                pass
+    if libjpeg is None:
+        _LIBJPEG_CACHE = False
+        return False
+
+    try:
+        ERR_HANDLER = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+        err_buf = ctypes.create_string_buffer(512)
+        cinfo = ctypes.create_string_buffer(2048)
+
+        libjpeg.jpeg_std_error.argtypes = [ctypes.c_void_p]
+        libjpeg.jpeg_std_error.restype = ctypes.c_void_p
+        libjpeg.jpeg_CreateCompress.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+        libjpeg.jpeg_CreateCompress.restype = None
+        libjpeg.jpeg_destroy_compress.argtypes = [ctypes.c_void_p]
+        libjpeg.jpeg_destroy_compress.restype = None
+
+        state = {'failed': False}
+        def on_err(_cinfo_ptr):
+            state['failed'] = True
+        err_cb = ERR_HANDLER(on_err)
+        err_cb_addr = ctypes.cast(err_cb, ctypes.c_void_p).value
+
+        # Prioritize standard 64-bit (520, 584) and 32-bit (376, 432) struct sizes first
+        common_sizes = [520, 584, 376, 432] + [s for s in range(320, 1024, 4) if s not in (520, 584, 376, 432)]
+        found_ver = None
+        found_sz = None
+        for ver in (62, 80, 70, 90):
+            for sz in common_sizes:
+                ctypes.memset(cinfo, 0, 2048)
+                libjpeg.jpeg_std_error(err_buf)
+                struct.pack_into("P", err_buf, 0, err_cb_addr)
+                struct.pack_into("P", cinfo, 0, ctypes.addressof(err_buf))
+                state['failed'] = False
+                libjpeg.jpeg_CreateCompress(cinfo, ver, sz)
+                if not state['failed']:
+                    found_ver = ver
+                    found_sz = sz
+                    libjpeg.jpeg_destroy_compress(cinfo)
+                    break
+            if found_ver is not None:
+                break
+
+        if found_ver is None:
+            _LIBJPEG_CACHE = False
+            return False
+
+        libjpeg.jpeg_mem_dest.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        libjpeg.jpeg_set_defaults.argtypes = [ctypes.c_void_p]
+        libjpeg.jpeg_set_quality.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        libjpeg.jpeg_start_compress.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        libjpeg.jpeg_write_scanlines.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+        libjpeg.jpeg_finish_compress.argtypes = [ctypes.c_void_p]
+
+        ptr_size = ctypes.sizeof(ctypes.c_void_p)
+        # In jpeg_compress_struct:
+        # 5 pointers (err, mem, progress, client_data, dest) + 2 ints (is_decompressor, global_state):
+        # 64-bit: 5*8 + 8 = 48; 32-bit: 5*4 + 8 = 28
+        w_off = 48 if ptr_size == 8 else 28
+
+        ctypes.memset(cinfo, 0, 2048)
+        libjpeg.jpeg_std_error(err_buf)
+        struct.pack_into("P", err_buf, 0, err_cb_addr)
+        struct.pack_into("P", cinfo, 0, ctypes.addressof(err_buf))
+        libjpeg.jpeg_CreateCompress(cinfo, found_ver, found_sz)
+        struct.pack_into("=IIii", cinfo, w_off, 16, 16, 1, 1)
+        libjpeg.jpeg_set_defaults(cinfo)
+
+        # Locate write_JFIF_header (1), JFIF_major_version (1), JFIF_minor_version (1),
+        # density_unit (0), X_density (1), Y_density (1); restart_in_rows is at idx - 4
+        jfif_sig = struct.pack("=iBBBBHH", 1, 1, 1, 0, 0, 1, 1)
+        idx = cinfo.raw[:found_sz].find(jfif_sig)
+        libjpeg.jpeg_destroy_compress(cinfo)
+
+        if idx < 4:
+            _LIBJPEG_CACHE = False
+            return False
+
+        restart_rows_off = idx - 4
+
+        libc_name = ctypes.util.find_library('c') or 'libc.so.6'
+        libc = ctypes.CDLL(libc_name)
+        libc.free.argtypes = [ctypes.c_void_p]
+        libc.free.restype = None
+
+        _LIBJPEG_CACHE = {
+            'lib': libjpeg,
+            'libc': libc,
+            'ver': found_ver,
+            'sz': found_sz,
+            'w_off': w_off,
+            'restart_rows_off': restart_rows_off,
+        }
+        log(f"Loaded libjpeg (ver={found_ver}, struct_size={found_sz}, restart_in_rows_off={restart_rows_off})")
+        return _LIBJPEG_CACHE
+    except Exception as e:
+        log(f"libjpeg init exception: {e}")
+        _LIBJPEG_CACHE = False
+        return False
+
+def _encode_jpeg_raw_libjpeg(gray_bytes, width, height):
+    """Compresses an 8-bit grayscale buffer using libjpeg ctypes with quality=100, restart_in_rows=1."""
+    info = _init_libjpeg()
+    if not info:
+        return None
+    libjpeg = info['lib']
+    libc = info['libc']
+    err_buf = ctypes.create_string_buffer(512)
+    cinfo = ctypes.create_string_buffer(2048)
+
+    libjpeg.jpeg_std_error(err_buf)
+    struct.pack_into("P", cinfo, 0, ctypes.addressof(err_buf))
+    libjpeg.jpeg_CreateCompress(cinfo, info['ver'], info['sz'])
+
+    out_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+    out_sz = ctypes.c_ulong(0)
+    libjpeg.jpeg_mem_dest(cinfo, ctypes.byref(out_ptr), ctypes.byref(out_sz))
+
+    struct.pack_into("=IIii", cinfo, info['w_off'], width, height, 1, 1)
+    libjpeg.jpeg_set_defaults(cinfo)
+    libjpeg.jpeg_set_quality(cinfo, 100, 1)
+    struct.pack_into("=i", cinfo, info['restart_rows_off'], 1)
+
+    libjpeg.jpeg_start_compress(cinfo, 1)
+    buf = ctypes.create_string_buffer(gray_bytes, len(gray_bytes))
+    base_addr = ctypes.addressof(buf)
+    row_ptrs = (ctypes.c_char_p * height)(*[
+        ctypes.cast(base_addr + r * width, ctypes.c_char_p) for r in range(height)
+    ])
+    libjpeg.jpeg_write_scanlines(cinfo, row_ptrs, height)
+    libjpeg.jpeg_finish_compress(cinfo)
+
+    result = ctypes.string_at(out_ptr, out_sz.value)
+    libjpeg.jpeg_destroy_compress(cinfo)
+    if out_ptr:
+        libc.free(ctypes.cast(out_ptr, ctypes.c_void_p))
+    return result
+
+def _encode_jpeg_raw_pil(gray_bytes, width, height):
+    """Compresses an 8-bit grayscale buffer using PIL/Pillow with quality=100, restart_marker_rows=1."""
+    try:
+        from PIL import Image
+        img = Image.frombytes('L', (width, height), gray_bytes)
+        bio = io.BytesIO()
+        img.save(bio, format='JPEG', quality=100, subsampling=0, restart_marker_rows=1)
+        return bio.getvalue()
+    except Exception:
+        return None
+
+def _encode_jpeg_raw_cjpeg(gray_bytes, width, height):
+    """Fallback using cjpeg CLI if available."""
+    pgm_header = f"P5\n{width} {height}\n255\n".encode('ascii')
+    try:
+        proc = subprocess.Popen(
+            ['cjpeg', '-grayscale', '-quality', '100', '-restart', '1'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stdout, _ = proc.communicate(pgm_header + gray_bytes)
+        if proc.returncode == 0 and stdout.startswith(b'\xff\xd8'):
+            return stdout
+    except Exception:
+        pass
+    return None
+
+def encode_deli_jpeg_strip(gray_bytes, width, band_h):
+    """
+    Performs Deli-JPEG strip transformation:
+      1. Encodes `width x band_h` 8-bit grayscale (0xFF=white, 0x00=black) as baseline JPEG
+         with quality=100 and restart_in_rows=1 (RST0..RST7 every 8 lines).
+      2. Locates SOS marker (0xFF 0xDA), reads its 16-bit big-endian length `sos_len` (0x0008),
+         and slices from `sos_idx + sos_len` to the end of the JPEG stream.
+      3. Prepends the 2-byte Deli-JPEG header `0xFF 0x2C` (overwriting the last 2 bytes of SOS).
+      4. Replaces the trailing `0xFF 0xD9` (EOI) with the final restart marker
+         `0xFF (0xD0 + ((mcu_rows - 1) % 8))` (which is `0xFF 0xD7` for a 256-line band).
+    """
+    jpeg_bytes = _encode_jpeg_raw_libjpeg(gray_bytes, width, band_h)
+    if not jpeg_bytes:
+        jpeg_bytes = _encode_jpeg_raw_pil(gray_bytes, width, band_h)
+    if not jpeg_bytes:
+        jpeg_bytes = _encode_jpeg_raw_cjpeg(gray_bytes, width, band_h)
+    if not jpeg_bytes:
+        return None
+
+    # Find SOS (0xFF 0xDA) marker in JPEG header
+    sos_idx = jpeg_bytes.find(b'\xff\xda')
+    if sos_idx < 0 or sos_idx + 4 > len(jpeg_bytes):
+        error("SOS marker (0xFFDA) not found in encoded JPEG band.")
+        return None
+
+    sos_len = struct.unpack(">H", jpeg_bytes[sos_idx + 2 : sos_idx + 4])[0]
+    start_pos = sos_idx + sos_len
+    if start_pos >= len(jpeg_bytes):
+        error("Invalid SOS length in encoded JPEG band.")
+        return None
+
+    strip = bytearray(jpeg_bytes[start_pos:])
+    strip[0] = 0xFF
+    strip[1] = 0x2C
+
+    mcu_rows = (band_h + 7) // 8
+    last_rst_marker = 0xD0 + ((mcu_rows - 1) & 7)
+    strip[-1] = last_rst_marker
+    return bytes(strip)
+
+def expand_1bit_to_gray8(bitmap_1bit, w_out, h_out):
+    """
+    Converts a 1-bit Deli bitmap (where 0 = white paper, 1 = black toner dot)
+    into an 8-bit grayscale buffer of size `w_out * h_out`
+    (where 0xFF = white paper, 0x00 = black toner dot).
+    """
+    return b"".join(BIT_TO_GRAY8_LUT[b] for b in bitmap_1bit)
+
+def parse_cups_options(opts_str):
+    opts = {}
+    if not opts_str:
+        return opts
+    for token in opts_str.split():
+        if '=' in token:
+            k, v = token.split('=', 1)
+            opts[k.lower()] = v.lower()
+        else:
+            opts[token.lower()] = 'true'
+    return opts
+
+def resolve_duplex_mode(header_duplex, header_tumble, opts):
+    """
+    Determines the requested duplex mode from both the CUPS raster header and job options.
+    Returns:
+      0 = Simplex
+      1 = Duplex Long-Edge (DuplexNoTumble)
+      2 = Duplex Short-Edge (DuplexTumble)
+    """
+    mode = 0
+    if header_duplex == 1:
+        mode = 2 if header_tumble else 1
+
+    dup_opt = opts.get('duplex', '')
+    if dup_opt in ('duplextumble', 'short-edge', 'two-sided-short-edge', 'tumble'):
+        return 2
+    elif dup_opt in ('duplexnotumble', 'long-edge', 'two-sided-long-edge', 'two-sided', 'twosided', '2sided', 'true', 'on', '1'):
+        return 1
+
+    sides_opt = opts.get('sides', '')
+    if sides_opt in ('two-sided-short-edge', 'short-edge', 'tumble'):
+        return 2
+    elif sides_opt in ('two-sided-long-edge', 'two-sided', 'twosided', '2sided', 'long-edge', 'duplex'):
+        return 1
+    elif sides_opt in ('one-sided', 'onesided', '1sided', 'simplex'):
+        return 0
+
+    if opts.get('nodup', '') in ('true', '1', 'on') or opts.get('noduplex', '') in ('true', '1', 'on'):
+        return 0
+
+    return mode
+
+def normalize_to_deli_1bit(raw_bitmap, width, height, bpl, bpp, colorspace, header, opts):
+    """
+    Converts the incoming CUPS raster bitmap to 1-bit Deli polarity:
+      0 (0x00) = white paper background (laser off / no toner)
+      1 (0xFF) = black toner dot (laser on)
+    """
+    user_invert = opts.get('invert', opts.get('deli-invert', ''))
+
+    if bpp == 8:
+        bpl_1bit = (width + 7) // 8
+        mono = bytearray(bpl_1bit * height)
+        border_sample = raw_bitmap[:min(len(raw_bitmap), 8 * bpl)] + raw_bitmap[max(0, len(raw_bitmap) - 8 * bpl):]
+        avg_border = sum(border_sample) / len(border_sample) if border_sample else (255 if colorspace in (0, 18) else 0)
+        white_is_high = (avg_border >= 128)
+        log(f"8-bit raster normalization: cspace={colorspace}, avg_border={avg_border:.1f}, white_is_high={white_is_high}")
+
+        if white_is_high:
+            for y in range(height):
+                row_in = raw_bitmap[y * bpl : y * bpl + width]
+                row_out_idx = y * bpl_1bit
+                for x, px in enumerate(row_in):
+                    if px < 128:
+                        mono[row_out_idx + (x >> 3)] |= (0x80 >> (x & 7))
+        else:
+            for y in range(height):
+                row_in = raw_bitmap[y * bpl : y * bpl + width]
+                row_out_idx = y * bpl_1bit
+                for x, px in enumerate(row_in):
+                    if px >= 128:
+                        mono[row_out_idx + (x >> 3)] |= (0x80 >> (x & 7))
+        pixel_bytes = bytes(mono)
+        if header.NegativePrint == 1 or user_invert in ('true', '1', 'on', 'yes'):
+            pixel_bytes = pixel_bytes.translate(INV_TABLE)
+        return pixel_bytes
+
+    # 1-bit monochrome (bpp == 1)
+    used_bpl = (width + 7) // 8
+    if bpl != used_bpl:
+        rows = [raw_bitmap[y * bpl : y * bpl + used_bpl] for y in range(height)]
+        raw_1bit = b''.join(rows)
+    else:
+        raw_1bit = raw_bitmap
+
+    if user_invert in ('true', '1', 'on', 'yes'):
+        log("Applying explicit user invert=true")
+        return raw_1bit.translate(INV_TABLE)
+    elif user_invert in ('false', '0', 'off', 'no'):
+        log("Applying explicit user invert=false")
+        return raw_1bit
+
+    border_rows = min(16, max(1, height // 32))
+    border_slice = raw_1bit[:border_rows * used_bpl] + raw_1bit[(height - border_rows) * used_bpl:]
+    border_ff = border_slice.count(0xFF)
+    border_00 = border_slice.count(0x00)
+    total_ff = raw_1bit.count(0xFF)
+    total_00 = raw_1bit.count(0x00)
+
+    if border_ff > border_00 * 2 and total_ff > total_00:
+        white_is_ff = True
+    elif border_00 > border_ff * 2 and total_00 >= total_ff:
+        white_is_ff = False
+    else:
+        white_is_ff = (colorspace in (0, 18))
+
+    should_invert = white_is_ff
+    if header.NegativePrint == 1:
+        should_invert = not should_invert
+
+    log(
+        f"1-bit polarity check: cspace={colorspace}, total_00={total_00}, total_ff={total_ff}, "
+        f"border_00={border_00}, border_ff={border_ff} -> white_is_ff={white_is_ff}, should_invert={should_invert}"
+    )
+
+    if should_invert:
+        return raw_1bit.translate(INV_TABLE)
+    return raw_1bit
+
+def emit_page_simplex_jbig(out, page_info, page_index_0based):
+    """
+    Simplex Engine A:
+    Writes a single PCL-XL Simplex page using 1-bit full-page JBIG1 compression
+    (SimplexPageMode = \xC0\x00\xF8\x34, ColorDepth = \xC0\x00\xF8\x62).
+    """
+    w_out = page_info['w_out']
+    h_out = page_info['h_out']
+    res = page_info['res']
+    media_name = page_info['media_name']
+    bitmap_aligned = page_info['bitmap_aligned']
+
+    jbig_data = encode_jbig(bitmap_aligned, w_out, h_out)
+    if not jbig_data:
+        error(f"Failed to compress Simplex page {page_index_0based + 1} to JBIG1.")
+        sys.exit(1)
+
+    checksum = compute_deli_checksum(jbig_data)
+    log(
+        f"Emitting Simplex page {page_index_0based + 1} (1-bit JBIG1): "
+        f"{w_out}x{h_out} @ {res}dpi, jbig_len={len(jbig_data)}, checksum=0x{checksum:08x}"
+    )
+
+    media_bytes = media_name.encode('ascii')
+    origin_dots = 96 if res == 600 else 48
+
+    page_header = (
+        b"\xC0\x01\xF8\x26\xC0\x01\xF8\x28"
+        + b"\xC0\x00\xF8\x34"
+        + b"\xC0\xFF\xF8\x27\xC1\x01\x00\xF8\xEC\xC8\xC0"
+        + bytes([len(media_bytes)]) + media_bytes + b"\xF8\x25\x43"
+        + b"\xD5\x00\x00\x80\x3F\x00\x00\x80\x3F\xF8\x2B\x77"
+        + b"\xC0\x01\xF8\x47\x71\xC0\x01\xF8\x48\x72\xC0\x01\xF8\x03\xC0\x00\xF8\xEA\x6A"
+        + struct.pack("<sHH", b"\xD3", origin_dots, origin_dots) + b"\xF8\x2A\x75"
+        + b"\xC0\x64\xF8\xEF\xC0\x00\xF8\xEE\x40\xC0\xCC\xF8\x2C\x7B"
+        + struct.pack("<sHH", b"\xD3", h_out, 0) + b"\xF8\x4C\x6B"
+    )
+
+    image_header = (
+        b"\xC0\x00\xF8\x64\xC0\x00\xF8\x62"
+        + struct.pack("<sH", b"\xC1", w_out) + b"\xF8\x6C"
+        + struct.pack("<sH", b"\xC1", h_out) + b"\xF8\x6B"
+        + struct.pack("<sHH", b"\xD1", w_out, h_out) + b"\xF8\x67"
+        + b"\xC0\x08\xF8\xFA\xC0\x02\xF8\xF9\xC1\x00\x00\xF8\xF8"
+        + struct.pack("<sH", b"\xC1", res) + b"\xF8\xF7"
+        + b"\xC1\x06\x00\xF8\xF6\xB0"
+    )
+
+    image_data_block = (
+        b"\xC1\x00\x00\xF8\x6D"
+        + struct.pack("<sH", b"\xC1", h_out) + b"\xF8\x63"
+        + b"\xC0\xF6\xF8\x65"
+        + struct.pack("<sI", b"\xC2", checksum) + b"\xF8\xF5\xB1"
+        + struct.pack("<sI", b"\xFA", len(jbig_data))
+        + jbig_data
+        + b"\xB7\xFA\x00\x00\x00\x00\xB2"
+    )
+
+    page_footer = b"\xC1\x01\x00\xF8\x31\x44"
+
+    out.write(page_header + image_header + image_data_block + page_footer)
+    out.flush()
+
+def emit_page_duplex_jpeg_bands(out, page_info, page_index_0based, effective_duplex):
+    """
+    Duplex Engine B:
+    Writes a PCL-XL Duplex page using 8-bit 256-line Deli-JPEG bands:
+      1 = Duplex Long-Edge  (DuplexPageMode=1: \xC0\x01\xF8\x35)
+      2 = Duplex Short-Edge (DuplexPageMode=0: \xC0\x00\xF8\x35)
+    """
+    w_out = page_info['w_out']
+    h_out = page_info['h_out']
+    res = page_info['res']
+    media_name = page_info['media_name']
+    bitmap_aligned = page_info['bitmap_aligned']
+
+    duplex_cmd = b"\xC0\x01\xF8\x35" if effective_duplex == 1 else b"\xC0\x00\xF8\x35"
+    side_label = "Front" if (page_index_0based % 2 == 0) else "Back"
+
+    media_bytes = media_name.encode('ascii')
+    origin_dots = 96 if res == 600 else 48
+
+    # BeginPage for the 256-line band engine ends right after SetHalftoneMethod (0x40)
+    page_header = (
+        b"\xC0\x01\xF8\x26\xC0\x01\xF8\x28"
+        + duplex_cmd
+        + b"\xC0\xFF\xF8\x27\xC1\x01\x00\xF8\xEC\xC8\xC0"
+        + bytes([len(media_bytes)]) + media_bytes + b"\xF8\x25\x43"
+        + b"\xD5\x00\x00\x80\x3F\x00\x00\x80\x3F\xF8\x2B\x77"
+        + b"\xC0\x01\xF8\x47\x71\xC0\x01\xF8\x48\x72\xC0\x01\xF8\x03\xC0\x00\xF8\xEA\x6A"
+        + struct.pack("<sHH", b"\xD3", origin_dots, origin_dots) + b"\xF8\x2A\x75"
+        + b"\xC0\x64\xF8\xEF\xC0\x00\xF8\xEE\x40"
+    )
+    out.write(page_header)
+
+    gray8_full = expand_1bit_to_gray8(bitmap_aligned, w_out, h_out)
+
+    # Cache identical bands (e.g. pure white bands) so encoding a page takes only a few milliseconds
+    band_strip_cache = {}
+
+    rem_h = h_out
+    y = 0
+    band_count = 0
+
+    while rem_h > 0:
+        band_h = min(rem_h, 256)
+        band_gray = gray8_full[y * w_out : (y + band_h) * w_out]
+
+        cache_key = (band_h, band_gray)
+        cached = band_strip_cache.get(cache_key)
+        if cached is not None:
+            strip, checksum = cached
+        else:
+            strip = encode_deli_jpeg_strip(band_gray, w_out, band_h)
+            if not strip:
+                error(f"Failed to encode Deli-JPEG band at y={y} (band_h={band_h}).")
+                sys.exit(1)
+            checksum = compute_deli_checksum(strip)
+            band_strip_cache[cache_key] = (strip, checksum)
+
+        strip_len = len(strip)
+
+        # Band header + BeginImage (0xB0) + ReadImage (0xB1) with ColorDepth=2 (e8Bit)
+        band_header = (
+            b"\xC0\xCC\xF8\x2C\x7B"
+            + struct.pack("<sHH", b"\xD3", rem_h, 0) + b"\xF8\x4C\x6B"
+            + b"\xC0\x00\xF8\x64\xC0\x02\xF8\x62"
+            + struct.pack("<sH", b"\xC1", w_out) + b"\xF8\x6C"
+            + struct.pack("<sH", b"\xC1", band_h) + b"\xF8\x6B"
+            + struct.pack("<sHH", b"\xD1", w_out, band_h) + b"\xF8\x67"
+            + b"\xC0\x08\xF8\xFA\xC0\x02\xF8\xF9\xC1\x00\x00\xF8\xF8"
+            + struct.pack("<sH", b"\xC1", res) + b"\xF8\xF7"
+            + b"\xC1\x06\x00\xF8\xF6\xB0"
+            + b"\xC1\x00\x00\xF8\x6D"
+            + struct.pack("<sH", b"\xC1", band_h) + b"\xF8\x63"
+            + b"\xC0\xF6\xF8\x65"
+            + struct.pack("<sI", b"\xC2", checksum) + b"\xF8\xF5\xB1"
+            + struct.pack("<sI", b"\xFA", strip_len)
+            + strip
+        )
+
+        # Band terminator ReadImage (1-byte 0xFF with compression 0xF7) + EndImage (0xB2)
+        band_footer = (
+            b"\xC1\x00\x00\xF8\x6D"
+            + struct.pack("<sH", b"\xC1", band_h) + b"\xF8\x63"
+            + b"\xC0\xF7\xF8\x65"
+            + b"\xC2\xFF\x00\x00\x00\xF8\xF5\xB1"
+            + b"\xFA\x01\x00\x00\x00\xFF\xB2"
+        )
+
+        out.write(band_header + band_footer)
+        rem_h -= band_h
+        y += band_h
+        band_count += 1
+
+    # EndPage (0x44)
+    page_footer = b"\xC1\x01\x00\xF8\x31\x44"
+    out.write(page_footer)
+    out.flush()
+
+    log(
+        f"Emitting Duplex page {page_index_0based + 1} ({side_label}, 8-bit Deli-JPEG bands): "
+        f"effective_duplex={effective_duplex}, duplex_cmd={duplex_cmd.hex()}, bands={band_count}"
+    )
+
+def emit_page(out, page_info, page_index_0based, effective_duplex):
+    """Dispatches page emission to the corresponding engine for Simplex vs. Duplex."""
+    if effective_duplex in (1, 2):
+        emit_page_duplex_jpeg_bands(out, page_info, page_index_0based, effective_duplex)
+    else:
+        emit_page_simplex_jbig(out, page_info, page_index_0based)
+
+def main():
+    if len(sys.argv) < 6:
+        error(f"Usage: {sys.argv[0]} job-id user title copies options [filename]")
+        sys.exit(1)
+
+    job_id = sys.argv[1]
+    user = sys.argv[2]
+    title = sys.argv[3] or "Untitled Job"
+    copies = sys.argv[4]
+    options_str = sys.argv[5]
+    opts = parse_cups_options(options_str)
+    log(f"Job {job_id} options: {opts}")
+
+    input_fd = 0
+    cleanup_fd = False
+    if len(sys.argv) > 6 and sys.argv[6] and sys.argv[6] != '-':
+        try:
+            input_fd = os.open(sys.argv[6], os.O_RDONLY)
+            cleanup_fd = True
+        except OSError as e:
+            error(f"Cannot open input file {sys.argv[6]}: {e}")
+            sys.exit(1)
+
+    libcups = load_libcups()
+    if not libcups:
+        error("libcups / libcupsimage C library could not be loaded. Please ensure libcups2 is installed.")
+        sys.exit(1)
+
+    libcups.cupsRasterOpen.argtypes = [ctypes.c_int, ctypes.c_int]
+    libcups.cupsRasterOpen.restype = ctypes.c_void_p
+    libcups.cupsRasterClose.argtypes = [ctypes.c_void_p]
+    libcups.cupsRasterClose.restype = None
+    libcups.cupsRasterReadHeader2.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    libcups.cupsRasterReadHeader2.restype = ctypes.c_uint
+    libcups.cupsRasterReadPixels.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint]
+    libcups.cupsRasterReadPixels.restype = ctypes.c_uint
+
+    CUPS_RASTER_READ = 0
+    ras = libcups.cupsRasterOpen(input_fd, CUPS_RASTER_READ)
+    if not ras:
+        error(f"cupsRasterOpen failed on descriptor {input_fd}.")
+        sys.exit(1)
+
+    economode_opt = opts.get('economode', 'false')
+    economode = 'ON' if economode_opt in ('true', 'on', '1') else 'OFF'
+
+    pages = []
+    header = CUPSPageHeader2()
+
+    try:
+        while libcups.cupsRasterReadHeader2(ras, ctypes.byref(header)):
+            page_num = len(pages) + 1
+            sys.stderr.write(f"PAGE: {page_num} 1\n")
+            sys.stderr.flush()
+
+            width = header.cupsWidth
+            height = header.cupsHeight
+            bpl = header.cupsBytesPerLine
+            bpp = header.cupsBitsPerPixel
+            colorspace = header.cupsColorSpace
+            res_x = header.HWResolution[0]
+            res_y = header.HWResolution[1]
+            duplex_val = header.Duplex
+            tumble_val = header.Tumble
+
+            duplex_mode = resolve_duplex_mode(duplex_val, tumble_val, opts)
+
+            log(
+                f"Page {page_num} header: {width}x{height}, bpl={bpl}, bpp={bpp}, "
+                f"cspace={colorspace}, res={res_x}x{res_y}, hdr_duplex={duplex_val}, "
+                f"hdr_tumble={tumble_val} -> resolved_duplex={duplex_mode}"
+            )
+
+            if width <= 0 or height <= 0:
+                width = 4768
+                height = 6824
+            if bpl <= 0:
+                bpl = (width * bpp + 7) // 8
+
+            raw_media = header.cupsPageSizeName.decode('latin1', 'ignore').strip('\x00').strip().lower()
+            if not raw_media:
+                raw_media = header.MediaClass.decode('latin1', 'ignore').strip('\x00').strip().lower()
+            media_name = MEDIA_NAME_MAP.get(raw_media, opts.get('pagesize', 'a4').upper())
+            if media_name not in ('A4', 'LETTER', 'LEGAL', 'EXECUTIVE', 'A5', 'B5', 'A6'):
+                media_name = 'A4'
+
+            res = res_x if res_x in (300, 600) else 600
+
+            cups_white_byte = b'\xFF' if colorspace in (0, 18) else b'\x00'
+
+            line_buf = ctypes.create_string_buffer(bpl)
+            lines = []
+            for y in range(height):
+                n = libcups.cupsRasterReadPixels(ras, line_buf, bpl)
+                if n < bpl:
+                    if n == 0:
+                        error(f"Premature end of raster at line {y}/{height}")
+                        break
+                    lines.append(line_buf.raw[:n] + cups_white_byte * (bpl - n))
+                else:
+                    lines.append(line_buf.raw)
+
+            if len(lines) < height:
+                pad_line = cups_white_byte * bpl
+                while len(lines) < height:
+                    lines.append(pad_line)
+
+            raw_bitmap = b''.join(lines)
+
+            pixel_bytes = normalize_to_deli_1bit(raw_bitmap, width, height, bpl, bpp, colorspace, header, opts)
+
+            used_bpl = (width + 7) // 8
+            aligned_bpl = ((used_bpl + 3) // 4) * 4
+            aligned_width = aligned_bpl * 8
+            aligned_height = ((height + 7) // 8) * 8
+
+            rem_bits = width & 7
+            if aligned_bpl != used_bpl or aligned_height != height or rem_bits != 0:
+                aligned_buf = bytearray(aligned_bpl * aligned_height)
+                last_mask = (0xFF << (8 - rem_bits)) & 0xFF if rem_bits else 0xFF
+                for y in range(height):
+                    src_row = bytearray(pixel_bytes[y * used_bpl : (y + 1) * used_bpl])
+                    if rem_bits and src_row:
+                        src_row[-1] &= last_mask
+                    aligned_buf[y * aligned_bpl : y * aligned_bpl + len(src_row)] = src_row
+                bitmap_aligned = bytes(aligned_buf)
+                w_out, h_out = aligned_width, aligned_height
+            else:
+                bitmap_aligned = pixel_bytes
+                w_out, h_out = width, height
+
+            pages.append({
+                'w_out': w_out,
+                'h_out': h_out,
+                'aligned_bpl': aligned_bpl,
+                'res': res,
+                'media_name': media_name,
+                'duplex_mode': duplex_mode,
+                'bitmap_aligned': bitmap_aligned,
+            })
+
+    finally:
+        libcups.cupsRasterClose(ras)
+        if cleanup_fd:
+            try:
+                os.close(input_fd)
+            except OSError:
+                pass
+
+    if not pages:
+        log("No pages found in print job.")
+        return
+
+    out = sys.stdout.buffer
+    first_page = pages[0]
+    res = first_page['res']
+    requested_duplex = max(p['duplex_mode'] for p in pages)
+
+    if requested_duplex != 0 and len(pages) == 1:
+        log("Single-page job requested with Duplex; switching to Simplex so the single sheet ejects immediately.")
+        effective_duplex = 0
+    else:
+        effective_duplex = requested_duplex
+
+    if effective_duplex != 0 and (len(pages) % 2 == 1):
+        last_p = pages[-1]
+        w_out = last_p['w_out']
+        h_out = last_p['h_out']
+        blank_bitmap = bytes((w_out // 8) * h_out)
+        log(f"Odd page count ({len(pages)}) in duplex job; appending blank white back page ({len(pages) + 1}) to complete duplex cycle.")
+        pages.append({
+            'w_out': w_out,
+            'h_out': h_out,
+            'aligned_bpl': last_p['aligned_bpl'],
+            'res': last_p['res'],
+            'media_name': last_p['media_name'],
+            'duplex_mode': effective_duplex,
+            'bitmap_aligned': blank_bitmap,
+        })
+
+    clean_user = "".join(c for c in user if c.isalnum() or c in "._- ")[:31] or "user"
+    clean_title = "".join(c for c in title if c.isalnum() or c in "._- ")[:63] or "job"
+
+    log(f"Job duplex decision: requested_duplex={requested_duplex}, page_count={len(pages)}, effective_duplex={effective_duplex}")
+
+    pjl_header = (
+        f"\x1b%-12345X@PJL JOB\n"
+        f"@PJL SET STRINGCODESET=UTF8\n"
+        f'@PJL SET USERNAME="{clean_user}"\n'
+        f"@PJL SET LMULTIPAGEPRINT=OFF\n"
+        f"@PJL COMMENT Deli P3100DN\n"
+        f'@PJL LJOBINFO USERID="{clean_user}" HOSTID="cups"\n'
+        f'@PJL SET JOBNAME="{clean_title}"\n'
+        f"@PJL SET ECONOMODE={economode}\n"
+        f"@PJL SET FIMPROVE=OFF\n"
+        f"@PJL SET FGHOST=OFF\n"
+        f"@PJL SET FDENSITY=OFF\n"
+        f"@PJL SET LPARM:PCL LFONTPRIORITY=NORESOLUTION\n"
+        f"@PJL SET TIMEOUT=0\n"
+        f"@PJL SET LCOLORMODEL=BLACK\n"
+        f"@PJL SET LSHARPEN=OFF\n"
+        f"@PJL SET LCTPREFERENCE=IMAGE\n"
+        f"@PJL SET PRINTQUALITY=NORMAL\n"
+        f"@PJL SET LPAGEMODE=NORMAL\n"
+        f"@PJL SET LCOLLATION=OFF\n"
+        f"@PJL SET PAGEPROTECT=OFF\n"
+        f"@PJL SET RESOLUTION={res}\n"
+        f"@PJL ENTER LANGUAGE=PCLXL\n"
+        f") HP-PCL XL;2;1;Comment Open Source CUPS Driver\n"
+    ).encode('utf-8')
+
+    # Simplex requires \xC0\x01\xF8\x19\x25 (ErrorReport=eBackChannel), while Duplex session starts directly at BeginSession
+    session_prefix = b"\xC0\x01\xF8\x19\x25" if effective_duplex == 0 else b""
+    session_init = (
+        session_prefix
+        + struct.pack("<sHH", b"\xD1", res, res) + b"\xF8\x89"
+        + b"\xC0\x00\xF8\x86"
+        + b"\xC0\x06\xF8\x8F\x41"
+        + b"\xC0\x00\xF8\x88"
+        + b"\xC0\x01\xF8\x82\x48"
+        + b"\xC8\xC0\x14Deli Enhanced XL=1.2\xF8\x81\x47"
+    )
+    out.write(pjl_header + session_init)
+
+    for idx, pinfo in enumerate(pages):
+        emit_page(out, pinfo, idx, effective_duplex)
+        side_str = "Front" if (idx % 2 == 0) else "Back"
+        log(
+            f"Rendered page {idx + 1}/{len(pages)} ({side_str}): "
+            f"{pinfo['w_out']}x{pinfo['h_out']} @ {pinfo['res']}dpi, "
+            f"media={pinfo['media_name']}, effective_duplex={effective_duplex}"
+        )
+
+    job_trailer = (
+        b"\x49\x42"
+        b"\x1b%-12345X@PJL EOJ\n"
+        b"@PJL LPORTROTATE\n"
+        b"\x1b%-12345X"
+    )
+    out.write(job_trailer)
+    out.flush()
+    log(f"Job completed successfully. Total pages emitted: {len(pages)}")
+
+if __name__ == '__main__':
+    try:
+        main()
+    except BrokenPipeError:
+        log("Broken pipe (print job cancelled).")
+        sys.exit(0)
